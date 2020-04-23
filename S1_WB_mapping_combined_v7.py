@@ -1,0 +1,447 @@
+import rsgislib, os, gdal, time, argparse, sys, numpy, rios, os.path, glob
+from numba import jit
+import os.path
+from rsgislib import imageutils, rastergis, imagefilter, imagecalc
+from rsgislib.rastergis import ratutils
+from rsgislib.segmentation import segutils
+from sklearn.ensemble import ExtraTreesClassifier
+from rsgislib.classification import classimgutils, classratutils
+from sklearn.preprocessing import MaxAbsScaler
+from sklearn.grid_search import GridSearchCV
+from rsgislib.imagecalc import BandDefn
+from rios import rat
+from scipy import stats
+import numpy as np
+from osgeo import gdal
+from skimage import filters
+from scipy.stats import skew
+import shutil
+
+
+
+start = time.time()
+
+###############################################################################################
+# definition of arguments
+parser = argparse.ArgumentParser(prog='Extraction of training data for water/non-water', description='Extraction of training data for use in water/non-water classification.')
+parser.add_argument('-i', metavar='', type=str, help='Path to the input image, i.e. original stacked image *_stack_lee.tif.')
+args = parser.parse_args()
+# terminate the script when incorrect inputs are provided:
+if args.i == None:
+	parser.print_help()
+	sys.exit('\n' + 'Error: Please specify an input image.')
+##############################################################################################
+
+##############################################################################################	
+inputImage=args.i
+print('')
+print('Input image: ' + inputImage)
+print('')
+
+##############################################################################################
+# output classifcation rootname
+outimage='/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Sentinel_1/Classified/KEA/'+inputImage.split('.')[0]+'_classified.kea'
+
+##############################################################################################
+# ancialliary datasets
+guf='/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Supporting_data/GUF_Barotseland_Zambia_extended.kea' # global urban footprint
+permWater='/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Supporting_data/classified_stack_2017_occurrence_v2_perm_water.kea' # permanent water layer
+globalWater='/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Supporting_data/seasonality_barotseland_snapped.tif' # global water seasonality layer
+otherMask='/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Supporting_data/barotseland_srtm_utm_lee_slope_gt1_5_AND_HAND_gt_30.shp' # training data for dry areas
+
+# check that ancilliary dataset exist
+if not os.path.isfile(guf):
+	sys.exit('\n' + 'Missing: Global Urban Footprint.')
+if not os.path.isfile(permWater):
+	sys.exit('\n' + 'Missing: Water occurence layer.')
+if not os.path.isfile(globalWater):
+	sys.exit('\n' + 'Missing: Pekel water seasonality layer.')
+if not os.path.isfile(otherMask):
+	sys.exit('\n' + 'Missing: "Other" mask.')
+
+############################################################################################################################################################################################
+# perform Lee filter
+#outputImage=inputImage.replace('.tif','_lee.tif')
+
+#imagefilter.applyLeeFilter(inputImage, outputImage, 3, 3, "GTiff", rsgislib.TYPE_32FLOAT)
+
+bandList=['VV','VH','VVdivVH']
+rsgislib.imageutils.setBandNames(inputImage, bandList)
+
+#inputImage=outputImage # define lee image as input for rest of the script
+
+###########################################################################
+###### reset nan values as -999 values
+nanOut=inputImage.replace('.tif','_nonan.tif')
+
+# define output names for each band
+b1=inputImage.replace('.tif','_b1.tif')
+b2=inputImage.replace('.tif','_b2.tif')
+b3=inputImage.replace('.tif','_b3.tif')
+
+# run gdal command to convert nan to a number, i.e. 0.0
+cmd='gdal_calc.py -A %s --A_band=1 --outfile=%s --calc="nan_to_num(A)"' %(inputImage,b1)
+os.system(cmd)
+cmd='gdal_calc.py -A %s --A_band=2 --outfile=%s --calc="nan_to_num(A)"' %(inputImage,b2)
+os.system(cmd)
+cmd='gdal_calc.py -A %s --A_band=3 --outfile=%s --calc="nan_to_num(A)"' %(inputImage,b3)
+os.system(cmd)
+
+
+gdalformat = 'KEA'
+
+# define the output names
+b1_nan=b1.replace('.tif','_b1_nan.tif')
+b2_nan=b2.replace('.tif','_b2_nan.tif')
+b3_nan=b3.replace('.tif','_b3_nan.tif')
+
+bandDefns = []
+bandDefns.append(BandDefn('b1', b1, 1))
+imagecalc.bandMath(b1_nan, '(b1==0.0)?-999:b1', gdalformat, rsgislib.TYPE_32FLOAT, bandDefns)
+bandDefns = []
+bandDefns.append(BandDefn('b2', b2, 1))
+imagecalc.bandMath(b2_nan, '(b2==0.0)?-999:b2', gdalformat, rsgislib.TYPE_32FLOAT, bandDefns)
+bandDefns = []
+bandDefns.append(BandDefn('b3', b3, 1))
+imagecalc.bandMath(b3_nan, '(b3==0.0)?-999:b3', gdalformat, rsgislib.TYPE_32FLOAT, bandDefns)
+
+gdalformat='GTiff'
+gdaltype = rsgislib.TYPE_32FLOAT
+imageutils.stackImageBands([b1_nan,b2_nan,b3_nan], ['VV','VH','VVdivVH']  , nanOut, None, -999, gdalformat, gdaltype)
+
+inputImage=nanOut
+###########################################################################
+###########################################################################
+
+##############################################################################################
+# Shepherd segmentation - this output will be used in second script to run classifier
+##############################################################################################
+print('Performing the segmentation...')
+
+outputClumps=inputImage.replace('.tif','_clumps2.kea')
+outputMeanImg=inputImage.replace('.tif','_clumps2_mean.kea')
+
+segutils.runShepherdSegmentation(inputImage, outputClumps, outputMeanImg, minPxls=100)
+bandList=['VV','VH','VVdivVH']  
+rsgislib.imageutils.setBandNames(outputMeanImg, bandList)
+rastergis.populateStats(outputClumps, True, True, False, 1)
+rastergis.populateStats(outputMeanImg, True, True, False, 1)
+#
+clumps=outputClumps # rename clumps image
+ratutils.populateImageStats(inputImage, clumps, calcMin=True,calcMax=True,calcMean=True, calcStDev=True) # add radar stats
+
+##############################################################################################
+# add global urban footprint stats
+
+gufSnap=guf.split('.')[0]+'_'+inputImage.split('.')[0]+'.tif'
+inRefImg=clumps # base raster to snap to
+gdalFormat = 'GTiff'
+rsgislib.imageutils.resampleImage2Match(inRefImg, guf, gufSnap, gdalFormat, interpMethod='nearestneighbour', datatype=None) # perform resampling/snap
+bandList=['guf']  
+rsgislib.imageutils.setBandNames(gufSnap, bandList)
+ratutils.populateImageStats(gufSnap, clumps, calcMax=True) # add urban footprint stats
+
+# remove the intermediate snapped guf image
+try:
+	os.remove(gufSnap)
+except Exception:
+	pass
+
+##############################################################################################
+# Extracting training data masks 
+##############################################################################################
+
+waterSnap=globalWater.split('.')[0]+'_'+inputImage.split('.')[0]+'_clump.tif'
+inRefImg=inputImage # base raster to snap to
+gdalFormat = 'GTiff'
+rsgislib.imageutils.resampleImage2Match(inRefImg, globalWater, waterSnap, gdalFormat, interpMethod='nearestneighbour', datatype=None) # perform resampling/snap
+
+##############################################################################################
+# create open water training data
+##############################################################################################
+#function to extract permanent water with low dB (lt -18dB)
+@jit
+def watermask(water_in, radar_in, outName, outShp): 
+	bandDefns = []
+	bandDefns.append(BandDefn('VV', radar_in, 1))
+	bandDefns.append(BandDefn('water', water_in, 1))
+	gdalformat = 'KEA'
+	imagecalc.bandMath(outName, '(VV<-18)&&(water==12)?1:0', gdalformat, rsgislib.TYPE_8UINT, bandDefns)
+
+water_in=waterSnap
+radar_in=inputImage.replace('.tif','_clumps2_mean.kea')
+outName=waterSnap.replace('.tif','_m18dB.tif')
+outShp=waterSnap.replace('.tif','_m18dB.shp')
+watermask(water_in, radar_in, outName, outShp) # implement function
+rsgislib.vectorutils.polygoniseRaster(outName, outShp, imgBandNo=1, maskImg=outName, imgMaskBandNo=1) # vectorize the result
+waterMask=outShp # define training data filename for rest of script
+
+##############################################################################################
+# create veg water training data 
+##############################################################################################
+
+# function to extract low VV/VH ratio (lt 0.5) 
+@jit
+def wetvegmask(water_in, radar_in, outName, outShp):
+	bandDefns = []
+	bandDefns.append(BandDefn('VVVH', radar_in, 3))
+	#bandDefns.append(BandDefn('water', water_in, 1))
+	gdalformat = 'KEA'
+	#imagecalc.bandMath(outName, '(VVVH<0.45)&&(water>=2)?1:0', gdalformat, rsgislib.TYPE_8UINT, bandDefns)
+	imagecalc.bandMath(outName, '(VVVH<0.5)?1:0', gdalformat, rsgislib.TYPE_8UINT, bandDefns)
+
+water_in=waterSnap
+radar_in=inputImage.replace('.tif','_clumps2_mean.kea')
+outName=waterSnap.replace('.tif','_wetveg.tif')
+outShp=waterSnap.replace('.tif','_wetveg.shp')
+wetvegmask(water_in, radar_in, outName, outShp) # implement function 
+rsgislib.vectorutils.polygoniseRaster(outName, outShp, imgBandNo=1, maskImg=outName, imgMaskBandNo=1) # vectorize the result
+vegwaterMask=outShp # define training data filename for rest of script
+
+# remove the intermediate snapped water image
+try:
+	shutil.move(waterSnap, '/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Sentinel_1/Intermediate_Files')
+except Exception:
+	pass
+
+##############################################################################################
+##############################################################################################
+######
+###### perform the classification
+######
+##############################################################################################
+##############################################################################################
+
+##############################################################################################
+# populate clumps with training data
+classesDict = dict()
+classesDict['Water'] = [1, waterMask]
+classesDict['Other'] = [2, otherMask]  
+classesDict['VegWater'] = [3, vegwaterMask]
+
+tmpPath = './temp_' + inputImage.split('.')[0]
+classesIntCol = 'ClassInt'
+classesNameCol = 'ClassStr'
+ratutils.populateClumpsWithClassTraining(outputClumps, classesDict, tmpPath, classesIntCol, classesNameCol)
+rsgislib.classification.classratutils.balanceSampleTrainingRandom(outputClumps, classesIntCol, 'classesIntColBal', 50, 5000) # balance the training data
+classesIntCol='classesIntColBal'
+
+##############################################################################################
+# use grid search to define the classifier
+variables = ['VVMin','VHMin','VVdivVHMin','VVMax','VHMax','VVdivVHMax','VVAvg','VHAvg','VVdivVHAvg', 'VVStd','VHStd','VVdivVHStd']
+classParameters = {'n_estimators':[10, 100, 500], 'max_features':[2, 3, 4]}
+gsearch = GridSearchCV(ExtraTreesClassifier(bootstrap = True), classParameters)
+classifier = classratutils.findClassifierParameters(outputClumps,  classesIntCol, variables,  preProcessor=None, gridSearch=gsearch)
+
+# define the output colours
+classColours = dict()
+classColours['Other'] = [212,125,83]
+classColours['Water'] = [157,212,255]
+classColours['VegWater'] = [191,255,0]
+
+##############################################################################################
+# run the classification
+###########################################################################################
+#  run thorugh mulitple classifications and store result in RAT
+runs=numpy.arange(1,51)
+runs=numpy.arange(1,3)
+for i in runs:
+	outColInt='OutClass_'+str(i) # define output class column
+	print('')
+	print('......processing: ' + outColInt)
+	print('')
+	classesIntCol = 'ClassInt'
+	rsgislib.classification.classratutils.balanceSampleTrainingRandom(outputClumps, classesIntCol, 'classesIntColBal', 50, 5000) # rebalance the training data
+	classesIntCol='classesIntColBal'
+	# run the classifier
+	classratutils.classifyWithinRAT(outputClumps, classesIntCol, classesNameCol, variables, classifier=classifier, classColours=classColours,preProcessor=MaxAbsScaler(),outColInt=outColInt)
+
+###########################################################################################
+# Read all results from RAT and extract mode, providing final result
+# Also, mask out nan values from the classification where vvMin==-999
+
+inRatFile = outputClumps
+ratDataset = gdal.Open(inRatFile, gdal.GA_Update) # Open RAT
+
+vvMin_val=[]
+vvMin_val.append(rat.readColumn(ratDataset, 'VVMin')) # read in urban footprint column
+vvMin_val=numpy.asarray(vvMin_val[0])
+
+guf_val=[]
+guf_val.append(rat.readColumn(ratDataset, 'gufMax')) # read in urban footprint column
+guf_val=numpy.asarray(guf_val[0])
+
+# define column names for output classifications
+x_col_names = []
+for i in runs:
+	# define output class column
+	col_name='OutClass_'+str(i)
+	x_col_names.append(col_name)
+
+X=[]
+# Read in data from each column
+for colName in x_col_names:
+    X.append(rat.readColumn(ratDataset, colName))
+
+mode = stats.mode(X)
+mode=numpy.asarray(mode[0][0])
+rios.rat.writeColumn(outputClumps, 'OutClass_mode', mode, colType=gdal.GFT_Integer)
+
+# calc certainty from mode and count of mode
+X_arr=numpy.asarray(X)
+x_count=[]
+x_percent=[]
+for i, m in zip((range(X_arr.shape[1])),mode):
+	b=X_arr[:,i]
+	count=numpy.count_nonzero(b==m)
+	x_percent.append(count/X_arr.shape[0])
+
+x_percent=numpy.asarray(x_percent)
+
+# where percentage match is less that 100%, classify as dry
+mode_cert=mode
+mode_cert[numpy.where((x_percent<1)&(mode_cert==1))]=2
+mode_cert[numpy.where((x_percent<1)&(mode_cert==3))]=2
+
+# where GUF == 255, and mode_cert==3 (vegWater) classify as dry
+mode_cert[numpy.where((guf_val==255)&(mode_cert==3))]=2
+
+# where vvMin==-999, unclassified
+mode_cert[numpy.where((vvMin_val==-999))]=0
+
+#write out the result
+names=[]
+for i in mode_cert:
+	if i==0:
+		names.append('Unclassified')
+	elif i==1:
+		names.append('Water')
+	elif i==2:
+		names.append('Other')
+	elif i==3:
+		names.append('VegWater')
+
+# write columns to RAT
+rios.rat.writeColumn(outputClumps, 'OutClass_mode_pc', x_percent, colType=gdal.GFT_Real)
+rios.rat.writeColumn(outputClumps, 'OutClass_mode_cert', mode_cert, colType=gdal.GFT_Integer)
+rios.rat.writeColumn(outputClumps, 'OutClass_mode_cert_names', names, colType=gdal.GFT_String)
+
+###########################################################################################
+# export rat column: mode with certainty to image
+gdalformat = 'KEA'
+datatype = rsgislib.TYPE_8INT
+fields = ['OutClass_mode_cert']
+outCert=inputImage.split('.')[0]+'_cert.kea'
+rastergis.exportCols2GDALImage(outputClumps, outCert, gdalformat, datatype, fields)
+
+####################################################################
+# snap permanent water	
+inProcessImg=permWater
+inRefImg=inputImage
+outSnap=permWater.replace('.kea','_'+inputImage.split('.')[0]+'_snap.kea')
+gdalformat = 'KEA'
+rsgislib.imageutils.resampleImage2Match(inRefImg, inProcessImg, outSnap, gdalformat,interpMethod='nearestneighbour', datatype=rsgislib.TYPE_8UINT)
+
+
+####################################################################
+# add permanent water mask
+permWaterMask=outSnap
+
+bandDefns = []
+bandDefns.append(BandDefn('class', outCert, 1))
+bandDefns.append(BandDefn('permWat', permWaterMask, 1))
+
+condition='(permWat==1)?1:class'
+
+gdalformat = 'kea'
+imagecalc.bandMath(outimage, condition, gdalformat, rsgislib.TYPE_8UINT, bandDefns)
+
+# remove the intermediate certainty classifcation image
+try:
+	shutil.move(outCert, '/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Sentinel_1/Intermediate_Files')
+except Exception:
+	pass
+
+###########################################################################################
+# select dry season images and apply refinement
+d=int(inputImage.split('-')[1])
+
+if (d >= 2) & (d <= 5): # select dry season images based on image month
+	print('')
+	print('Finished...')
+	print('')
+else:
+	print('')
+	print('Refinement needed.')
+	print('')
+	
+
+	clumpsMean=outputMeanImg
+	# read in VV mean data and original classificaiton
+	ds1 = gdal.Open(clumpsMean)
+	meanVV = np.array(ds1.GetRasterBand(1).ReadAsArray())
+	ds1 = gdal.Open(outimage)
+	classImg = np.array(ds1.GetRasterBand(1).ReadAsArray())
+
+	#	mask out mean VV pixels where original classificaiton was open water
+	meanVV[numpy.where(classImg!=1)]=numpy.nan
+	meanVVsmoothed5=filters.gaussian(meanVV,sigma=5) # smooth out masked image using gaussian, sigma=5
+	
+	ds1=None
+	
+	# applu Otsu to smoothed backscatter with rule to ignore nan
+	threshold=filters.threshold_otsu(meanVVsmoothed5[meanVVsmoothed5<0])
+	print('')
+	print('Ostu threshold = ' + str(threshold))
+	print('')
+	meanVVsmoothed5=None
+	meanVV=None
+	
+	####################################################################
+	# apply threshold 
+	bandDefns = []
+	bandDefns.append(BandDefn('class', outimage, 1))
+	bandDefns.append(BandDefn('vvMean', clumpsMean, 1))
+	
+	condition='(class==1)&&(vvMean>'+str(threshold)+')?2:class'
+	outClass=outimage.replace('.kea','_otsu.kea')
+	gdalformat = 'KEA'
+	imagecalc.bandMath(outClass, condition, gdalformat, rsgislib.TYPE_8UINT, bandDefns)
+	
+	bandDefns = []
+	bandDefns.append(BandDefn('class', outClass, 1))
+	bandDefns.append(BandDefn('permWat', permWaterMask, 1))
+	
+	condition='(permWat==1)?1:class'
+	
+	outClass='/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Sentinel_1/Classified/KEA//'+inputImage.split('.')[0]+'_classified_refined2.kea'
+	
+	gdalformat = 'KEA'
+	imagecalc.bandMath(outClass, condition, gdalformat, rsgislib.TYPE_8UINT, bandDefns)
+
+	try:
+		shutil.move(outimage.replace('.kea','_otsu.kea'), '/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Sentinel_1/Intermediate_Files')
+	except Exception:
+		pass
+	
+	# remove all open water snapped images
+	for file in glob.glob('*'+os.path.split(inputImage)[1].split('.')[0]+'*wb*'):
+		shutil.move(file, '/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Sentinel_1/Intermediate_Files')
+
+	###################################################################
+	print('')
+	print('Finished refinement.')
+	print('')
+	
+
+###########################################################################################
+
+# move all open water snapped images
+for file in glob.glob(os.path.split(permWater)[0]+'/*'+os.path.split(inputImage)[1].split('.')[0]+'*'):
+        shutil.move(file, '/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Sentinel_1/Intermediate_Files')
+        
+# retain clump files but move to new folder
+for file in glob.glob('*'+os.path.split(inputImage)[1].split('.')[0]+'*clumps*'):
+        shutil.move(file, '/home/georgina/Desktop/MyData/Data/LINUX_WORK/Projects/Zambia/Sentinel_1/Intermediate_Files')
+		
+print('It took {0:0.1f} minutes'.format((time.time() - start) / 60)) #time-stamp

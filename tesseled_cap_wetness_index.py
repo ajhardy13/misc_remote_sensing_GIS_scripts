@@ -1,0 +1,3 @@
+("Composite_m3to5_y2017to2017@1" * 0.1509) + ("Composite_m3to5_y2017to2017@2" * 0.1973) + ("Composite_m3to5_y2017to2017@3" * 0.3279) + ("Composite_m3to5_y2017to2017@4" * 0.3406) + ("Composite_m3to5_y2017to2017@5" * (−0.7112)) + ("Composite_m3to5_y2017to2017@6" * (−0.4572))
+
+("Composite_m3to5_y2017to2017@1" * 0.2626) + ("Composite_m3to5_y2017to2017@2" * 0.2141) + ("Composite_m3to5_y2017to2017@3" * 0.0926) + ("Composite_m3to5_y2017to2017@4" * 0.0656) + ("Composite_m3to5_y2017to2017@5" * (−0.7629)) + ("Composite_m3to5_y2017to2017@6" * (-0.5388))
